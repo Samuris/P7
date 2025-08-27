@@ -47,20 +47,17 @@ def load_onnx_model(path="best_model.onnx"):
         return None
 
 # ======================================================
-# Prétraitement "gabarit" basé sur df_app (pas de scikit-learn)
+# Prétraitement "gabarit" basé sur df_app (get_dummies)
 # ======================================================
 def fit_dummy_template(df_app: pd.DataFrame, target_col: str = "TARGET"):
     base = df_app.drop(columns=[target_col], errors="ignore").copy()
-    # colonnes catégorielles et numériques
     cat_cols = base.select_dtypes(include=["object"]).columns.tolist()
     num_cols = [c for c in base.columns if c not in cat_cols]
-    # one-hot complet sur les catégorielles du DF d'entraînement
     dummies = pd.get_dummies(base[cat_cols].astype(str), dummy_na=False)
-    template_cols = num_cols + list(dummies.columns)  # ordre final
+    template_cols = num_cols + list(dummies.columns)
     return num_cols, cat_cols, template_cols
 
 def transform_with_template(X: pd.DataFrame, num_cols, cat_cols, template_cols) -> pd.DataFrame:
-    # s'assurer que toutes les colonnes existent
     Xc = X.copy()
     # numériques
     num_part = {}
@@ -69,20 +66,17 @@ def transform_with_template(X: pd.DataFrame, num_cols, cat_cols, template_cols) 
         num_part[c] = v.fillna(0.0).astype(np.float32)
     num_df = pd.DataFrame(num_part, index=X.index)
 
-    # catégorielles -> one hot selon les catégories vues à l'entraînement
+    # catégorielles
     cat_df_input = pd.DataFrame(index=X.index)
     for c in cat_cols:
         cat_df_input[c] = Xc[c].astype(str) if c in Xc.columns else ""
-
     dummies = pd.get_dummies(cat_df_input.astype(str), dummy_na=False)
 
-    # concat puis réindexer dans l'ORDRE du gabarit
     out = pd.concat([num_df, dummies], axis=1)
     out = out.reindex(columns=template_cols, fill_value=0).astype(np.float32)
     return out
 
 def _align_to_expected_dim(sess, X_mat: pd.DataFrame | np.ndarray) -> np.ndarray:
-    # convert DF->np si besoin
     arr = X_mat.to_numpy(dtype=np.float32) if isinstance(X_mat, pd.DataFrame) else X_mat.astype(np.float32)
     exp_dim = sess.get_inputs()[0].shape[1]
     if exp_dim is None:
@@ -93,38 +87,53 @@ def _align_to_expected_dim(sess, X_mat: pd.DataFrame | np.ndarray) -> np.ndarray
     if cur_dim < exp_dim:
         pad = np.zeros((arr.shape[0], exp_dim - cur_dim), dtype=np.float32)
         return np.concatenate([arr, pad], axis=1)
-    # trop long -> tronquer
     return arr[:, :exp_dim]
 
-def run_onnx_proba(sess, X_np: np.ndarray, debug: bool = False) -> float:
+def run_onnx_raw(sess, X_np: np.ndarray):
     input_name = sess.get_inputs()[0].name
-    outputs = sess.run(None, {input_name: X_np})
+    return sess.run(None, {input_name: X_np})
+
+def pick_proba(outputs, proba_col: int, debug: bool=False) -> float:
     proba = outputs[0]
     if debug:
         st.write("DEBUG sortie ONNX type:", type(proba), "shape:", getattr(proba, "shape", None))
-        st.write("DEBUG sortie ONNX raw:", proba)
-    # cas classiques
+        st.write("DEBUG sortie ONNX sample:", proba[0] if isinstance(proba, np.ndarray) else proba)
     if isinstance(proba, np.ndarray):
         if proba.ndim == 2:
-            if proba.shape[1] >= 2:
-                return float(proba[0, 1])  # proba classe 1
-            else:
-                return float(proba[0, 0])  # unique colonne -> proba déjà
+            c = max(0, min(proba.shape[1]-1, proba_col))
+            return float(proba[0, c])
         if proba.ndim == 1:
             return float(proba[0])
     if isinstance(proba, list):
         v = proba[0]
         if isinstance(v, (list, tuple, np.ndarray)):
-            v = v[1] if len(v) >= 2 else v[0]
+            v = v[proba_col] if len(v) > proba_col else v[0]
         return float(v)
-    raise ValueError(f"Format de sortie ONNX non géré: {type(proba)} / shape={getattr(proba, 'shape', None)}")
+    raise ValueError(f"Format sortie ONNX non géré: {type(proba)} / shape={getattr(proba, 'shape', None)}")
+
+@st.cache_resource
+def infer_best_proba_col(sess, df_app: pd.DataFrame, num_cols, cat_cols, template_cols, sample_n: int = 256) -> int:
+    """Devine si la proba de la classe positive (TARGET=1) est en colonne 0 ou 1."""
+    if df_app.empty or "TARGET" not in df_app.columns:
+        return 1
+    sample = df_app.drop(columns=["TARGET"]).head(sample_n)
+    y = df_app["TARGET"].head(len(sample)).astype(int).to_numpy()
+    X_t = transform_with_template(sample, num_cols, cat_cols, template_cols)
+    X_np = _align_to_expected_dim(sess, X_t)
+    outs = run_onnx_raw(sess, X_np)
+    proba = outs[0]
+    if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] >= 2:
+        acc1 = ((proba[:, 1] >= 0.5).astype(int) == y).mean()
+        acc0 = ((proba[:, 0] >= 0.5).astype(int) == y).mean()
+        return int(acc1 >= acc0)  # 1 si col1 est meilleure, sinon 0
+    return 1
 
 # ======================================================
 # 1. Config
 # ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
-MODEL_FILE = "best_model.onnx"      # si tu as exporté avec zipmap=False et proba, c'est parfait
+MODEL_FILE = "best_model.onnx"   # si tu as une version exportée avec zipmap=False + proba
 APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
@@ -141,7 +150,7 @@ else:
     st.error("❌ application_train.csv introuvable.")
     df_app = pd.DataFrame()
 
-# gabarit de colonnes (basé sur df_app)
+# gabarit de colonnes
 if not df_app.empty:
     NUM_COLS, CAT_COLS, TEMPLATE_COLS = fit_dummy_template(df_app)
 else:
@@ -160,11 +169,14 @@ else:
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
-# debug
+# sidebar debug + choix colonne proba
 with st.sidebar:
     debug_mode = st.checkbox("🔧 Mode debug ONNX", value=False)
-    if sess:
-        st.caption(f"Input attendu: {sess.get_inputs()[0].shape}")
+    auto_col = infer_best_proba_col(sess, df_app, NUM_COLS, CAT_COLS, TEMPLATE_COLS) if sess and not df_app.empty else 1
+    st.caption(f"Colonne proba détectée: {auto_col} (0 ou 1)")
+    invert = st.checkbox("Inverser colonne proba ?", value=False)
+    PROBA_COL = auto_col ^ int(invert)   # XOR pour inverser si coché
+    st.caption(f"Colonne proba utilisée: {PROBA_COL}")
 
 # ======================================================
 # 2. Mode
@@ -186,18 +198,15 @@ if sess and mode == "Client existant":
         if "TARGET" in client_row:
             client_row = client_row.drop("TARGET")
 
-        # Remplacement NaN/inf
         client_row = client_row.replace([np.nan, np.inf, -np.inf], 0)
         client_dict = client_row.to_dict()
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            # 1) transformer exactement comme df_app
             X_t = transform_with_template(X, NUM_COLS, CAT_COLS, TEMPLATE_COLS)
-            # 2) aligner la dimension à celle de l'ONNX
             X_np = _align_to_expected_dim(sess, X_t)
-            # 3) run
-            prob_default = run_onnx_proba(sess, X_np, debug=debug_mode)
+            outs = run_onnx_raw(sess, X_np)
+            prob_default = pick_proba(outs, PROBA_COL, debug=debug_mode)
 
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
@@ -215,7 +224,7 @@ if sess and mode == "Client existant":
             st.session_state["history"].append(record)
             append_to_csv(record, HISTORY_FILE)
 
-        # Comparaison univariée
+        # Univarié
         st.subheader("📈 Comparaison univariée")
         if st.checkbox("Afficher histogramme comparaison"):
             columns_list = [c for c in df_app.columns if c != "TARGET"]
@@ -228,7 +237,7 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
-        # Comparaison bivariée
+        # Bivarié
         st.subheader("📊 Analyse bivariée")
         if st.checkbox("Afficher scatterplot bivarié"):
             cols = [c for c in df_app.columns if c != "TARGET"]
@@ -259,7 +268,8 @@ elif sess and mode == "Nouveau client":
         X = pd.DataFrame([new_client])
         X_t = transform_with_template(X, NUM_COLS, CAT_COLS, TEMPLATE_COLS)
         X_np = _align_to_expected_dim(sess, X_t)
-        prob_default = run_onnx_proba(sess, X_np, debug=debug_mode)
+        outs = run_onnx_raw(sess, X_np)
+        prob_default = pick_proba(outs, PROBA_COL, debug=debug_mode)
 
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
