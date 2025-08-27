@@ -87,7 +87,7 @@ def predict_proba(sess, X: pd.DataFrame):
 # ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
-MODEL_FILE = "best_model.onnx"
+MODEL_FILE = "best_model_proba.onnx"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
@@ -270,6 +270,7 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
 
 
 
