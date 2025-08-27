@@ -10,19 +10,21 @@ import seaborn as sns
 # ============================
 def load_model_any(model_path="best_model.joblib"):
     try:
-        skops_path = os.path.splitext(model_path)[0] + ".skops"
-        if os.path.exists(skops_path):
-            import skops.io as sio
-            model = sio.load(skops_path)
-        else:
-            import joblib
-            model = joblib.load(model_path)
+        import joblib
+        obj = joblib.load(model_path)
 
-        expected_features = getattr(model, "feature_names_in_", None)
+        # Cas 1 : le fichier contient un dict
+        if isinstance(obj, dict):
+            model = obj.get("model", None)
+            expected_features = obj.get("expected_features", [])
+            st.info("ℹ️ Modèle chargé depuis un dictionnaire (joblib)")
+        else:
+            # Cas 2 : le fichier contient directement un modèle sklearn
+            model = obj
+            expected_features = getattr(model, "feature_names_in_", [])
+
         if expected_features is None:
             expected_features = []
-        else:
-            expected_features = list(expected_features)
 
         st.success("✅ Modèle chargé avec succès")
         return model, expected_features
@@ -49,6 +51,8 @@ def ensure_features(df: pd.DataFrame, expected_features, reference_row: dict) ->
     return df[[f for f in expected_features]]
 
 def predict_proba_safely(mdl, X: pd.DataFrame):
+    if mdl is None:
+        raise ValueError("Modèle non chargé")
     if hasattr(mdl, "predict_proba"):
         proba = mdl.predict_proba(X)
         return float(proba[0, 1])
