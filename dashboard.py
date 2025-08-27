@@ -8,13 +8,7 @@ import seaborn as sns
 # ============================
 # 1. Chargement du modèle
 # ============================
-model = None
-expected_features = []
-reference_row = {}
-load_error = None
-
 def load_model_any(model_path="best_model.joblib"):
-    global model, expected_features, load_error
     try:
         skops_path = os.path.splitext(model_path)[0] + ".skops"
         if os.path.exists(skops_path):
@@ -31,11 +25,11 @@ def load_model_any(model_path="best_model.joblib"):
             expected_features = list(expected_features)
 
         st.success("✅ Modèle chargé avec succès")
+        return model, expected_features
+
     except Exception as e:
-        load_error = str(e)
-        model = None
-        expected_features = []
         st.error(f"❌ Erreur lors du chargement du modèle : {e}")
+        return None, []
 
 def load_reference_row(path="reference_row.csv"):
     try:
@@ -46,7 +40,7 @@ def load_reference_row(path="reference_row.csv"):
         st.warning(f"Impossible de charger la ligne de référence : {e}")
         return {}
 
-def ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_features(df: pd.DataFrame, expected_features, reference_row: dict) -> pd.DataFrame:
     if not expected_features:
         return df
     for feat in expected_features:
@@ -74,8 +68,12 @@ MODEL_FILE = "best_model.joblib"
 REFERENCE_ROW_FILE = "reference_row.csv"
 APPLICATION_TRAIN_CSV = "application_train.csv"
 
-load_model_any(MODEL_FILE)
+# Charger modèle + reference row
+model, expected_features = load_model_any(MODEL_FILE)
 reference_row = load_reference_row(REFERENCE_ROW_FILE)
+
+if model is None:
+    st.stop()  # Stop si modèle non chargé
 
 # ============================
 # 3. Choix du mode
@@ -85,7 +83,7 @@ mode = st.radio("Choisissez un mode :", ["Client existant", "Nouveau client"])
 # ============================
 # Mode : Client existant
 # ============================
-if mode == "Client existant" and model:
+if mode == "Client existant":
     uploaded_file = st.file_uploader("Uploader un dataset (ex: application_train.csv)", type=["csv"])
     if uploaded_file:
         df_app = pd.read_csv(uploaded_file)
@@ -103,13 +101,13 @@ if mode == "Client existant" and model:
 
         if st.button("⚡ Prédire ce client"):
             input_df = pd.DataFrame([client_dict])
-            input_df = ensure_features(input_df)
+            input_df = ensure_features(input_df, expected_features, reference_row)
             proba = predict_proba_safely(model, input_df)
             repayment = 1 - proba
             st.metric("Probabilité de remboursement", f"{repayment*100:.1f}%")
             st.metric("Probabilité de défaut", f"{proba*100:.1f}%")
 
-        # --- Graphique : distribution de population ---
+        # --- Graphique : distribution univariée ---
         st.subheader("📈 Comparaison univariée avec la population")
         if st.checkbox("Afficher histogramme"):
             cols = df_app.columns.tolist()
@@ -117,7 +115,8 @@ if mode == "Client existant" and model:
             feature = st.selectbox("Choisir une feature", cols, index=0)
             fig, ax = plt.subplots()
             if "TARGET" in df_app.columns:
-                sns.histplot(df_app, x=feature, hue="TARGET", bins=50, kde=False, ax=ax, palette={0:"green",1:"red"})
+                sns.histplot(df_app, x=feature, hue="TARGET", bins=50, kde=False, ax=ax,
+                             palette={0:"green",1:"red"}, alpha=0.6)
                 ax.legend(title="TARGET", labels=["0 = Accepté", "1 = Refusé"])
             else:
                 sns.histplot(df_app[feature].dropna(), bins=50, kde=True, ax=ax)
@@ -139,14 +138,15 @@ if mode == "Client existant" and model:
                                 palette={0:"green",1:"red"}, alpha=0.5, ax=ax)
             else:
                 sns.scatterplot(data=df_app.sample(min(5000,len(df_app))), x=f1, y=f2, color="blue", alpha=0.5, ax=ax)
-            ax.scatter(client_dict.get(f1,np.nan), client_dict.get(f2,np.nan), color="yellow", s=120, label="Client")
+            ax.scatter(client_dict.get(f1,np.nan), client_dict.get(f2,np.nan),
+                       color="yellow", s=120, label="Client")
             ax.legend()
             st.pyplot(fig)
 
 # ============================
 # Mode : Nouveau client
 # ============================
-elif mode == "Nouveau client" and model:
+elif mode == "Nouveau client":
     st.subheader("Créer un nouveau client")
     new_client = {
         "AMT_INCOME_TOTAL": st.number_input("Revenu total", value=200000.0),
@@ -158,7 +158,7 @@ elif mode == "Nouveau client" and model:
 
     if st.button("⚡ Prédire ce nouveau client"):
         input_df = pd.DataFrame([new_client])
-        input_df = ensure_features(input_df)
+        input_df = ensure_features(input_df, expected_features, reference_row)
         proba = predict_proba_safely(model, input_df)
         repayment = 1 - proba
         st.metric("Probabilité de remboursement", f"{repayment*100:.1f}%")
@@ -171,7 +171,8 @@ elif mode == "Nouveau client" and model:
             feature = st.selectbox("Feature à comparer", [c for c in df_app.columns if c not in ["TARGET"]], index=0, key="newf")
             fig, ax = plt.subplots()
             if "TARGET" in df_app.columns:
-                sns.histplot(df_app, x=feature, hue="TARGET", bins=50, kde=False, ax=ax, palette={0:"green",1:"red"})
+                sns.histplot(df_app, x=feature, hue="TARGET", bins=50, kde=False, ax=ax,
+                             palette={0:"green",1:"red"}, alpha=0.6)
                 ax.legend(title="TARGET", labels=["0 = Accepté", "1 = Refusé"])
             else:
                 sns.histplot(df_app[feature].dropna(), bins=50, kde=True, ax=ax)
