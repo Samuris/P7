@@ -5,10 +5,13 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
-import joblib, pickle
+import pickle
+
+# on garde joblib seulement pour compat de nom, mais on unpickle nous-mêmes
+import joblib  # noqa: F401
 from matplotlib.patches import Patch
 
-# onnxruntime est optionnel (utilisé si best_model.joblib contient des onnx_bytes)
+# onnxruntime optionnel (au cas où best_model.joblib contient {'onnx_bytes': ...})
 try:
     import onnxruntime as ort
     HAS_ORT = True
@@ -20,6 +23,7 @@ except Exception:
 # ==============================
 class SafeUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
+        # Tolère des symboles cythonisés qui n'existent pas selon la version
         if "sklearn._loss._loss" in module and name.startswith("__pyx_unpickle_"):
             def dummy(*args, **kwargs):
                 raise AttributeError(f"Incompatible attribute {name}")
@@ -62,12 +66,12 @@ def sample_feature(df: pd.DataFrame, feature: str, sample_size: int = 10000):
 
 def draw_client_marker(ax, x, color="yellow", label="Client sélectionné"):
     """
-    Marque proprement la position du client :
-    - bande verticale semi-transparente centrée sur x (largeur ~ bin d'histogramme)
-    - chevron en haut pour l'œil
-    - entrée de légende discrète
+    Marque la position du client :
+    - bande verticale semi-transparente centrée sur x
+    - chevron en haut
+    - étiquette au-dessus de la bande
     """
-    # Estime la largeur des bins si déjà tracés
+    # largeur de bin estimée si déjà dispo, sinon 1% de l'axe
     bin_w = None
     for p in ax.patches:
         if hasattr(p, "get_width"):
@@ -79,10 +83,20 @@ def draw_client_marker(ax, x, color="yellow", label="Client sélectionné"):
     if bin_w is None:
         bin_w = (xlim[1] - xlim[0]) * 0.01
 
-    ax.axvspan(x - bin_w/2, x + bin_w/2, color=color, alpha=0.25)
+    # Bande + chevron
+    ax.axvspan(x - bin_w/2, x + bin_w/2, color=color, alpha=0.25, zorder=2.5)
     ylim = ax.get_ylim()
-    ax.plot([x], [ylim[1]*0.95], marker="v", markersize=10, color=color, clip_on=False)
+    y_tip = ylim[1] * 0.92
+    ax.plot([x], [y_tip], marker="v", markersize=10, color=color, clip_on=False, zorder=3)
 
+    # Étiquette compacte
+    ax.annotate(f"{x:.2f}" if isinstance(x, (int, float, np.floating)) else str(x),
+                xy=(x, y_tip), xytext=(0, 14), textcoords="offset points",
+                ha="center", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", fc=color, ec="none", alpha=0.25),
+                color="black", fontsize=9, zorder=3)
+
+    # Légende (entrée discrète)
     handles, labels = ax.get_legend_handles_labels()
     if label not in labels:
         handles.append(Patch(facecolor=color, alpha=0.25, label=label))
@@ -116,7 +130,7 @@ def load_model_any(path="best_model.joblib"):
         st.error(f"Erreur chargement modèle : {e}")
         return {"kind": "error", "err": str(e)}
 
-    # Wrapper ONNX (dict avec onnx_bytes)
+    # Cas wrapper ONNX {'onnx_bytes': ..., 'feature_order': [...]}
     if isinstance(obj, dict) and "onnx_bytes" in obj:
         if not HAS_ORT:
             st.error("Le fichier contient un modèle ONNX mais onnxruntime n'est pas installé.")
@@ -129,10 +143,7 @@ def load_model_any(path="best_model.joblib"):
                 n_in = None
             st.success("✅ Modèle ONNX chargé (via best_model.joblib).")
             feat_order = obj.get("feature_order", None)
-            if feat_order is not None and isinstance(feat_order, (list, tuple)):
-                feat_order = list(feat_order)
-            else:
-                feat_order = None
+            feat_order = list(feat_order) if isinstance(feat_order, (list, tuple)) else None
             return {"kind": "onnx", "sess": sess, "n_features": n_in, "feature_order": feat_order}
         except Exception as e:
             st.error(f"Erreur ONNXRuntime : {e}")
@@ -151,10 +162,10 @@ def load_model_any(path="best_model.joblib"):
 # ==============================
 def ensure_features_sklearn(row: dict, expected_features: list | None, reference_row: dict | None):
     """
-    Reproduit la logique Flask:
-    - si expected_features connu: on crée un DF avec ces colonnes
-    - on complète les manquantes via reference_row (sinon 0)
-    - cast en numérique quand possible (sinon on laisse tel quel si le pipeline gère)
+    Repro de l'API Flask :
+    - si expected_features connu: DF avec ces colonnes (complète via reference_row, sinon 0)
+    - sinon: DF direct + complétion via reference_row
+    - cast numérique si possible (sinon on laisse pour que le pipeline gère)
     """
     if expected_features:
         data = {}
@@ -182,7 +193,7 @@ def ensure_features_sklearn(row: dict, expected_features: list | None, reference
 
 def vectorize_for_onnx(row: dict, feature_order: list, reference_row: dict, n_features: int):
     """
-    Construit un vecteur float32 (1, n_features) dans l'ordre des colonnes de référence.
+    Vecteur float32 (1, n_features) dans l'ordre donné.
     """
     vals = []
     for feat in feature_order:
@@ -258,15 +269,16 @@ def predict_proba_generic(bundle: dict, row_dict: dict, ref_df: pd.DataFrame, re
 # ==============================
 # App
 # ==============================
-st.title("📊 Dashboard de Credit Scoring")
+st.title("Dashboard de Credit Scoring")
 
-MODEL_FILE = "best_model.joblib"  # on garde cette extension
+MODEL_FILE = "best_model.joblib"              # on garde cette extension
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
 APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 REFERENCE_ROW_CSV = "reference_row.csv"
 HISTORY_FILE = "history.csv"
+NEW_CLIENTS_FILE = "new_clients.csv"
 
 bundle = load_model_any(MODEL_FILE)
 reference_row, ref_feature_order = load_reference_row(REFERENCE_ROW_CSV)
@@ -276,7 +288,7 @@ if os.path.exists(APPLICATION_TRAIN_CSV):
     df_app = load_csv(APPLICATION_TRAIN_CSV)
     st.success("Dataset client chargé.")
 else:
-    st.error("❌ application_train.csv introuvable.")
+    st.error("application_train.csv introuvable.")
     df_app = pd.DataFrame()
 
 # Artefacts
@@ -284,7 +296,7 @@ fi_df = pd.read_csv(FEATURE_IMPORTANCE_CSV) if os.path.exists(FEATURE_IMPORTANCE
 th_df = pd.read_csv(THRESHOLDS_CSV) if os.path.exists(THRESHOLDS_CSV) else pd.DataFrame()
 data_drift_available = os.path.exists(DATA_DRIFT_REPORT_HTML)
 
-# Historique (persistant + session)
+# Historique
 if os.path.exists(HISTORY_FILE):
     persistent_history = pd.read_csv(HISTORY_FILE)
 else:
@@ -293,26 +305,48 @@ if "history" not in st.session_state:
     st.session_state["history"] = []
 
 # ==============================
-# UI
+# Mode
 # ==============================
-st.header("⚙️ Sélection du Mode de Test")
-mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
+st.header("Sélection du Mode de Test")
+mode = st.radio("Choisissez un mode :", options=["Client existant", "Nouveau client"])
 
-# -------- Client existant --------
+# Palette cible
+target_palette = {0: "tab:blue", 1: "tab:red"}
+target_names = {0: "Crédit remboursé (0)", 1: "Défaut (1)"}
+
+# ==============================
+# Client existant
+# ==============================
 if bundle.get("kind") != "error" and mode == "Client existant":
     if not df_app.empty:
         max_index = len(df_app) - 1
-        idx = st.number_input(f"Index du client (0 → {max_index})", min_value=0, max_value=max_index, value=0)
-        client_row = df_app.iloc[idx].copy()
-        true_target = client_row.get("TARGET", None)
-        st.write("**Vérité terrain (TARGET)** :", true_target)
+        row_index = st.number_input(f"Index du client (0 à {max_index})", min_value=0, max_value=max_index, value=0)
 
-        # dict sans TARGET
+        client_row = df_app.iloc[row_index].copy()
+        true_target = client_row.get("TARGET", None)
+        st.write(f"**Vérité terrain** : {true_target}")
         if "TARGET" in client_row:
             client_row = client_row.drop("TARGET")
         client_row = client_row.replace([np.nan, np.inf, -np.inf], 0)
         client_dict = client_row.to_dict()
 
+        st.subheader("Données du Client Sélectionné")
+        st.write(client_dict)
+
+        # ----- Édition des données du client -----
+        if st.checkbox("Modifier les données du client"):
+            st.write("Modifiez les champs ci-dessous :")
+            edited_client = {}
+            for key, val in client_dict.items():
+                try:
+                    val = float(val)
+                    edited_client[key] = st.number_input(f"{key}", value=val, key=f"edit_{key}")
+                except Exception:
+                    edited_client[key] = st.text_input(f"{key}", value=str(val), key=f"edit_{key}")
+            client_dict = edited_client
+            st.write("Données modifiées :", client_dict)
+
+        # ----- Prédiction locale -----
         if st.button("⚡ Prédire ce client"):
             prob_default = predict_proba_generic(bundle, client_dict, df_app, reference_row, ref_feature_order)
             rep_str, def_str = display_probability(prob_default)
@@ -320,124 +354,206 @@ if bundle.get("kind") != "error" and mode == "Client existant":
             st.markdown(def_str, unsafe_allow_html=True)
             decision = prob_default >= 0.5
             if true_target is not None:
-                st.success("✅ Bonne prédiction" if bool(true_target) == decision else "⚠️ Mauvaise prédiction")
+                st.success("Le modèle a correctement prédit le résultat.") if bool(true_target) == decision else st.warning("Le modèle s'est trompé dans sa prédiction.")
             record = {
                 "Mode": "Client existant",
-                "Index": idx,
+                "Index": row_index,
                 "Vérité terrain": true_target,
                 "default_probability": prob_default,
-                "decision": decision,
+                "decision": decision
             }
             st.session_state["history"].append(record)
             append_to_csv(record, HISTORY_FILE)
 
-        # --- Comparaison univariée
-        st.subheader("📈 Comparaison univariée")
-        if st.checkbox("Afficher histogramme comparaison"):
-            columns_list = [c for c in df_app.columns if c != "TARGET"]
-            feature = st.selectbox("Feature", columns_list, index=0)
+        # ----- Comparaison univariée -----
+        st.subheader("Comparaison univariée avec la Population")
+        if st.checkbox("Afficher histogramme de comparaison"):
+            columns_list = df_app.columns.tolist()
+            if "TARGET" in columns_list:
+                columns_list.remove("TARGET")
+            selected_feature = st.selectbox("Feature à comparer", columns_list, index=0)
+
+            filtre_target = st.selectbox("Filtrer par TARGET", ["Tous", "0 (Crédit OK)", "1 (Défaut)"], index=0)
+            df_plot = df_app.copy()
+            if filtre_target.startswith("0"):
+                df_plot = df_plot[df_plot["TARGET"] == 0]
+            elif filtre_target.startswith("1"):
+                df_plot = df_plot[df_plot["TARGET"] == 1]
+
             fig, ax = plt.subplots()
-            sns.histplot(df_app, x=feature, hue="TARGET", palette={0: "blue", 1: "red"}, kde=True, ax=ax)
-            client_value = client_dict.get(feature, 0)
+            if filtre_target == "Tous":
+                sns.histplot(df_app, x=selected_feature, hue="TARGET",
+                             palette=target_palette, kde=True, ax=ax, alpha=0.6, element="step")
+            else:
+                sns.histplot(df_plot, x=selected_feature, kde=True, ax=ax, color="tab:blue" if "0" in filtre_target else "tab:red", alpha=0.6, element="step")
+            client_value = client_dict.get(selected_feature, 0)
             draw_client_marker(ax, client_value, color="yellow", label="Client sélectionné")
+            ax.set_title(f"Distribution de {selected_feature}", fontsize=14)
+            ax.set_xlabel(selected_feature, fontsize=12)
+            ax.set_ylabel("Fréquence", fontsize=12)
             st.pyplot(fig)
 
-        # --- Comparaison bivariée
-        st.subheader("📊 Analyse bivariée")
-        if st.checkbox("Afficher scatterplot bivarié"):
-            cols = [c for c in df_app.columns if c != "TARGET"]
-            feature_x = st.selectbox("X", cols, index=0)
-            feature_y = st.selectbox("Y", cols, index=1)
+        # ----- Analyse bivariée -----
+        st.subheader("Analyse bivariée")
+        if st.checkbox("Afficher graphique bivarié"):
+            cols = df_app.columns.tolist()
+            if "TARGET" in cols:
+                cols.remove("TARGET")
+            feature_x = st.selectbox("Sélectionnez la feature X", cols, index=0, key="existing_x")
+            feature_y = st.selectbox("Sélectionnez la feature Y", cols, index=1, key="existing_y")
+            sample_size = 5000
             df_sample = df_app[[feature_x, feature_y, "TARGET"]].replace([np.nan, np.inf, -np.inf], 0)
-            if len(df_sample) > 5000:
-                df_sample = df_sample.sample(5000, random_state=42)
-            fig, ax = plt.subplots()
+            if len(df_sample) > sample_size:
+                df_sample = df_sample.sample(sample_size, random_state=42)
+            fig_scatter, ax_scatter = plt.subplots()
             sns.scatterplot(data=df_sample, x=feature_x, y=feature_y, hue="TARGET",
-                            palette={0: "blue", 1: "red"}, alpha=0.5, ax=ax)
-            ax.scatter(client_dict.get(feature_x, np.nan),
-                       client_dict.get(feature_y, np.nan),
-                       color="orange", s=120, label="Client sélectionné")
-            ax.legend()
-            st.pyplot(fig)
+                            palette=target_palette, alpha=0.5, ax=ax_scatter)
+            client_x = client_dict.get(feature_x, np.nan)
+            client_y = client_dict.get(feature_y, np.nan)
+            ax_scatter.scatter(client_x, client_y, color="orange", s=120, label="Client")
+            ax_scatter.set_title(f"Analyse bivariée: {feature_x} vs {feature_y}", fontsize=14)
+            ax_scatter.set_xlabel(feature_x, fontsize=12)
+            ax_scatter.set_ylabel(feature_y, fontsize=12)
+            ax_scatter.legend()
+            st.pyplot(fig_scatter)
+    else:
+        st.error("Dataset introuvable ou vide pour les clients existants.")
 
-# -------- Nouveau client --------
+# ==============================
+# Nouveau client
+# ==============================
 elif bundle.get("kind") != "error" and mode == "Nouveau client":
-    new_client = {}
-    new_client["AMT_INCOME_TOTAL"] = st.number_input("AMT_INCOME_TOTAL", value=200000.0)
-    new_client["DAYS_BIRTH"] = st.number_input("DAYS_BIRTH", value=-15000.0)
-    new_client["DAYS_EMPLOYED"] = st.number_input("DAYS_EMPLOYED", value=-3000.0)
+    st.subheader("Créer un Nouveau Client")
 
-    if st.button("⚡ Prédire nouveau client"):
+    new_client = {}
+    new_client["AMT_INCOME_TOTAL"] = st.number_input("AMT_INCOME_TOTAL", value=200000.0, key="new_AMT_INCOME_TOTAL")
+    new_client["DAYS_BIRTH"] = st.number_input("DAYS_BIRTH", value=-15000.0, key="new_DAYS_BIRTH")
+    new_client["DAYS_EMPLOYED"] = st.number_input("DAYS_EMPLOYED", value=-3000.0, key="new_DAYS_EMPLOYED")
+
+    st.write("Ajouter d'autres champs (optionnel) :")
+    if not df_app.empty:
+        available_cols = df_app.columns.tolist()
+        if "TARGET" in available_cols:
+            available_cols.remove("TARGET")
+        additional_fields = st.multiselect("Sélectionnez d'autres champs à ajouter", available_cols, default=[])
+        for col in additional_fields:
+            val = st.text_input(f"{col}", value="0", key=f"new_{col}")
+            try:
+                new_client[col] = float(val)
+            except Exception:
+                new_client[col] = val
+
+    st.subheader("Données du Nouveau Client")
+    st.write(new_client)
+
+    if st.button("⚡ Prédire ce nouveau client"):
         prob_default = predict_proba_generic(bundle, new_client, df_app, reference_row, ref_feature_order)
-        rep_str, def_str = display_probability(prob_default)
-        st.markdown(rep_str, unsafe_allow_html=True)
-        st.markdown(def_str, unsafe_allow_html=True)
+        rep_str_new, def_str_new = display_probability(prob_default)
+        st.markdown(rep_str_new, unsafe_allow_html=True)
+        st.markdown(def_str_new, unsafe_allow_html=True)
         decision = prob_default >= 0.5
         record = {
             "Mode": "Nouveau client",
             "Données": new_client,
             "default_probability": prob_default,
-            "decision": decision,
+            "decision": decision
         }
         st.session_state["history"].append(record)
         append_to_csv(record, HISTORY_FILE)
+        if st.checkbox("Ajouter ce client aux données ?"):
+            append_to_csv(new_client, NEW_CLIENTS_FILE)
+            st.success("Client ajouté aux données permanentes.")
 
-    # Comparaisons
+    # Comparaisons possibles si dataset dispo
     if not df_app.empty:
-        st.subheader("📈 Comparaison univariée")
-        if st.checkbox("Comparer histogramme (nouveau client)"):
-            cols = [c for c in df_app.columns if c != "TARGET"]
-            feature = st.selectbox("Feature", cols, index=0, key="new_univar")
-            fig, ax = plt.subplots()
-            sns.histplot(df_app, x=feature, hue="TARGET", palette={0: "blue", 1: "red"}, kde=True, ax=ax)
-            draw_client_marker(ax, new_client.get(feature, 0), color="orange", label="Nouveau client")
-            st.pyplot(fig)
+        st.subheader("Comparaison univariée avec la Population (Nouveau Client)")
+        if st.checkbox("Afficher histogramme de comparaison (nouveau client)"):
+            columns_list = df_app.columns.tolist()
+            if "TARGET" in columns_list:
+                columns_list.remove("TARGET")
+            selected_feature_new = st.selectbox("Feature à comparer", columns_list, index=0, key="new_feature")
+            fig_new, ax_new = plt.subplots()
+            sns.histplot(df_app, x=selected_feature_new, hue="TARGET",
+                         palette=target_palette, kde=True, ax=ax_new, alpha=0.6, element="step")
+            client_value_new = new_client.get(selected_feature_new, 0)
+            draw_client_marker(ax_new, client_value_new, color="orange", label="Nouveau client")
+            ax_new.set_title(f"Distribution de {selected_feature_new} (Nouveau Client)", fontsize=14)
+            ax_new.set_xlabel(selected_feature_new, fontsize=12)
+            ax_new.set_ylabel("Fréquence", fontsize=12)
+            st.pyplot(fig_new)
 
-        st.subheader("📊 Analyse bivariée")
-        if st.checkbox("Comparer scatterplot (nouveau client)"):
-            cols = [c for c in df_app.columns if c != "TARGET"]
-            fx = st.selectbox("X", cols, index=0, key="new_x")
-            fy = st.selectbox("Y", cols, index=1, key="new_y")
-            df_sample = df_app[[fx, fy, "TARGET"]].replace([np.nan, np.inf, -np.inf], 0)
-            if len(df_sample) > 5000:
-                df_sample = df_sample.sample(5000, random_state=42)
-            fig, ax = plt.subplots()
-            sns.scatterplot(data=df_sample, x=fx, y=fy, hue="TARGET",
-                            palette={0: "blue", 1: "red"}, alpha=0.5, ax=ax)
-            ax.scatter(new_client.get(fx, np.nan),
-                       new_client.get(fy, np.nan),
-                       color="orange", s=120, label="Nouveau client")
-            ax.legend()
-            st.pyplot(fig)
+        st.subheader("Analyse bivariée (Nouveau Client)")
+        if st.checkbox("Afficher graphique bivarié (nouveau client)"):
+            cols = df_app.columns.tolist()
+            if "TARGET" in cols:
+                cols.remove("TARGET")
+            feature_x_new = st.selectbox("Sélectionnez la feature X", cols, index=0, key="new_x")
+            feature_y_new = st.selectbox("Sélectionnez la feature Y", cols, index=1, key="new_y")
+            df_sample_new = df_app[[feature_x_new, feature_y_new, "TARGET"]].replace([np.nan, np.inf, -np.inf], 0)
+            if len(df_sample_new) > 5000:
+                df_sample_new = df_sample_new.sample(5000, random_state=42)
+            fig_scatter_new, ax_scatter_new = plt.subplots()
+            sns.scatterplot(data=df_sample_new, x=feature_x_new, y=feature_y_new, hue="TARGET",
+                            palette=target_palette, alpha=0.5, ax=ax_scatter_new)
+            ax_scatter_new.scatter(new_client.get(feature_x_new, np.nan),
+                                   new_client.get(feature_y_new, np.nan),
+                                   color="orange", s=120, label="Nouveau client")
+            ax_scatter_new.set_title(f"Analyse bivariée: {feature_x_new} vs {feature_y_new}", fontsize=14)
+            ax_scatter_new.set_xlabel(feature_x_new, fontsize=12)
+            ax_scatter_new.set_ylabel(feature_y_new, fontsize=12)
+            ax_scatter_new.legend()
+            st.pyplot(fig_scatter_new)
 
-# -------- Historique --------
-st.header("🗂️ Historique des Tests")
-if os.path.exists(HISTORY_FILE):
-    persistent_history = pd.read_csv(HISTORY_FILE)
-else:
-    persistent_history = pd.DataFrame()
-
+# ==============================
+# Historique des Tests (Permanent)
+# ==============================
+st.header("Historique des Tests (Permanent)")
 if st.session_state["history"]:
-    hist = pd.DataFrame(st.session_state["history"])
-    combined = pd.concat([persistent_history, hist], ignore_index=True)
+    session_history = pd.DataFrame(st.session_state["history"])
+    combined_history = pd.concat([persistent_history, session_history], ignore_index=True)
 else:
-    combined = persistent_history
+    combined_history = persistent_history
 
-with st.expander("Afficher l'historique complet", expanded=True):
-    st.dataframe(combined, height=500)
-    if "default_probability" in combined:
-        avg_repayment = (1 - combined["default_probability"]).mean()
-        st.metric("Performance Moyenne (Probabilité remboursement)", f"{avg_repayment*100:.1f}%")
+with st.expander("Afficher l'historique complet des tests", expanded=True):
+    st.dataframe(combined_history, height=500)
+    if "default_probability" in combined_history:
+        avg_repayment = (1 - combined_history["default_probability"]).mean()
+        st.metric(label="Performance Moyenne (Probabilité de remboursement)", value=f"{avg_repayment*100:.1f}%")
+    else:
+        st.info("Pas d'indicateur de performance disponible.")
 
-# -------- Données générales --------
-with st.expander("📑 Données Générales"):
+# ==============================
+# Données Générales (Données d'Analyse)
+# ==============================
+with st.expander("Afficher les Données Générales", expanded=False):
+    st.subheader("Feature Importance Complète et Signification")
     if not fi_df.empty:
-        st.subheader("Feature Importance")
         st.dataframe(fi_df)
+        top_features = fi_df.sort_values(by="Importance", ascending=False).head(10)
+        explanations = {
+            "AMT_INCOME_TOTAL": "Revenu total du client.",
+            "DAYS_BIRTH": "Âge du client (en jours, négatif).",
+            "DAYS_EMPLOYED": "Nombre de jours d'emploi (négatif si en cours).",
+        }
+        st.write("**Signification des Top Features :**")
+        for _, row in top_features.iterrows():
+            feat = row["Feature"]
+            imp = row["Importance"]
+            exp = explanations.get(feat, "Pas d'explication fournie.")
+            st.markdown(f"- **{feat}** (Importance: {imp:.3f}) : {exp}")
+    else:
+        st.info("Aucune feature importance à afficher.")
+
+    st.subheader("Thresholds Complète")
     if not th_df.empty:
-        st.subheader("Thresholds")
         st.dataframe(th_df)
+    else:
+        st.info("Aucun thresholds à afficher.")
+
+    st.subheader("Rapport de Data Drift")
     if data_drift_available:
-        st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
-            st.components.v1.html(f.read(), height=600, scrolling=True)
+            data_drift_html = f.read()
+        st.components.v1.html(data_drift_html, height=600, scrolling=True)
+    else:
+        st.info("Aucun rapport de data drift disponible.")
