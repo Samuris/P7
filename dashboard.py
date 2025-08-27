@@ -28,7 +28,7 @@ st.set_page_config(page_title="Credit Scoring", layout="wide")
 API_URL = st.sidebar.text_input("API URL", value="http://127.0.0.1:5000/predict")
 
 # Dossiers/fichiers par défaut
-DATA_DIR = st.sidebar.text_input("Dossier données", value="./donnée")
+DATA_DIR = st.sidebar.text_input("Dossier données", value="./donnéecoupé")
 APP_TRAIN_CSV = os.path.join(DATA_DIR, "application_train.csv")
 
 # Artefacts (on essaie plusieurs noms: avec espace ou underscore)
@@ -411,3 +411,4 @@ else:
 # Footer
 # ------------------------------
 st.caption("© Projet P7 — Tableau de bord Streamlit")
+
