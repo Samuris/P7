@@ -72,32 +72,42 @@ def load_onnx_model(path="best_model.onnx"):
         return None
 
 def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
-    # 🔹 Récupérer les features attendues par le modèle ONNX
     input_name = sess.get_inputs()[0].name
-    expected_dim = sess.get_inputs()[0].shape[1]  # ex: 247 colonnes
+    expected_dim = sess.get_inputs()[0].shape[1]  # nombre de features attendu
 
-    # 🔹 Encodage catégoriel
+    # Encodage / nettoyage de base
     X_prepared = prepare_input(X, ref_df)
 
-    # 🔹 Compléter ou tronquer les colonnes pour correspondre au modèle
+    # 🔹 Ajout des colonnes manquantes d'un coup
     if X_prepared.shape[1] < expected_dim:
         missing = expected_dim - X_prepared.shape[1]
-        for i in range(missing):
-            X_prepared[f"_missing_{i}"] = 0.0  # ajoute colonnes factices
+        missing_cols = pd.DataFrame(
+            np.zeros((len(X_prepared), missing), dtype=np.float32),
+            columns=[f"_missing_{i}" for i in range(missing)]
+        )
+        X_prepared = pd.concat([X_prepared, missing_cols], axis=1)
     elif X_prepared.shape[1] > expected_dim:
         X_prepared = X_prepared.iloc[:, :expected_dim]
 
-    # 🔹 Convertir en numpy
+    # Conversion en float32 numpy
     inputs = {input_name: X_prepared.astype(np.float32).to_numpy()}
 
-    # 🔹 Exécution ONNX
+    # Inference
     outputs = sess.run(None, inputs)
-    if len(outputs) == 2:
-        proba = outputs[1]
-    else:
-        proba = outputs[0]
+    proba = outputs[0]
 
-    return float(proba[0, 1])
+    # Cas 1 : sortie shape (1,2) → prendre la 2e proba (classe positive)
+    if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] == 2:
+        return float(proba[0, 1])
+    # Cas 2 : sortie shape (1,) → déjà une proba
+    elif isinstance(proba, np.ndarray) and proba.ndim == 1:
+        return float(proba[0])
+    # Cas fallback : liste
+    elif isinstance(proba, list):
+        return float(proba[0])
+    else:
+        raise ValueError(f"Format de sortie ONNX non géré : {type(proba)}, shape={getattr(proba, 'shape', None)}")
+
 
 
 # ======================================================
@@ -288,4 +298,5 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
 
