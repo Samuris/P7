@@ -353,8 +353,11 @@ if bundle.get("kind") != "error" and mode == "Client existant":
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
             decision = prob_default >= 0.5
-            if true_target is not None:
-                st.success("Le modèle a correctement prédit le résultat.") if bool(true_target) == decision else st.warning("Le modèle s'est trompé dans sa prédiction.")
+           if bool(true_target) == decision:
+    st.success("Le modèle a correctement prédit le résultat.")
+else:
+    st.warning("Le modèle s'est trompé dans sa prédiction.")
+
             record = {
                 "Mode": "Client existant",
                 "Index": row_index,
@@ -557,3 +560,4 @@ with st.expander("Afficher les Données Générales", expanded=False):
         st.components.v1.html(data_drift_html, height=600, scrolling=True)
     else:
         st.info("Aucun rapport de data drift disponible.")
+
