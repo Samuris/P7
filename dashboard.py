@@ -41,28 +41,10 @@ def display_probability(prob_default):
     return rep_str, def_str
 
 # ======================================================
-# Préparation des features (encodage catégorielles)
-# ======================================================
-def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame = None) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        if out[col].dtype == object or isinstance(out[col].iloc[0], str):
-            # encoder catégoriel en int
-            if ref_df is not None and col in ref_df.columns:
-                categories = ref_df[col].astype(str).unique()
-                mapping = {cat: i for i, cat in enumerate(categories)}
-                out[col] = out[col].astype(str).map(mapping).fillna(-1).astype(np.float32)
-            else:
-                out[col], _ = pd.factorize(out[col].astype(str))
-        else:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
-    return out.astype(np.float32)
-
-# ======================================================
 # ONNX Model
 # ======================================================
 @st.cache_resource
-def load_onnx_model(path="best_model.onnx"):
+def load_onnx_model(path="best_model_proba.onnx"):
     try:
         sess = ort.InferenceSession(path)
         st.success("✅ Modèle ONNX chargé avec succès.")
@@ -75,12 +57,9 @@ def predict_proba(sess, X: pd.DataFrame):
     input_name = sess.get_inputs()[0].name
     inputs = {input_name: X.astype(np.float32).to_numpy()}
     outputs = sess.run(None, inputs)
-    # Comme on a mis zipmap=False, la sortie est un tableau numpy (n, 2)
+    # zipmap=False → sortie numpy (n, 2)
     proba = outputs[0]
-    return float(proba[0, 1])  # probabilité de défaut (classe 1)
-
-
-
+    return float(proba[0, 1])  # probabilité défaut (classe 1)
 
 # ======================================================
 # 1. Config
@@ -140,7 +119,7 @@ if sess and mode == "Client existant":
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba(sess, X, df_app)
+            prob_default = predict_proba(sess, X)   # ✅ corrigé
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -199,7 +178,7 @@ elif sess and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba(sess, X, df_app)
+        prob_default = predict_proba(sess, X)   # ✅ corrigé
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -270,8 +249,3 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
-
-
-
-
-
