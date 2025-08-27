@@ -6,9 +6,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import onnxruntime as ort
 
-# ------------------------------
-# Fonctions utilitaires
-# ------------------------------
+# ======================================================
+# Utils
+# ======================================================
 @st.cache_data
 def load_csv(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
@@ -40,9 +40,27 @@ def display_probability(prob_default):
     def_str = f"<span style='color: {'red' if (1 - prob_default) < 0.4 else 'black'}; font-size: 20px;'>Probabilité de défaut : {prob_default_pct:.1f} %</span>"
     return rep_str, def_str
 
-# ------------------------------
-# Prédiction ONNX
-# ------------------------------
+# ======================================================
+# Préparation des features (encodage catégorielles)
+# ======================================================
+def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame = None) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == object or isinstance(out[col].iloc[0], str):
+            # encoder catégoriel en int
+            if ref_df is not None and col in ref_df.columns:
+                categories = ref_df[col].astype(str).unique()
+                mapping = {cat: i for i, cat in enumerate(categories)}
+                out[col] = out[col].astype(str).map(mapping).fillna(-1).astype(np.float32)
+            else:
+                out[col], _ = pd.factorize(out[col].astype(str))
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    return out.astype(np.float32)
+
+# ======================================================
+# ONNX Model
+# ======================================================
 @st.cache_resource
 def load_onnx_model(path="best_model.onnx"):
     try:
@@ -53,19 +71,20 @@ def load_onnx_model(path="best_model.onnx"):
         st.error(f"Erreur chargement modèle ONNX : {e}")
         return None
 
-def predict_proba(sess, X: pd.DataFrame):
+def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
+    X_prepared = prepare_input(X, ref_df)
     input_name = sess.get_inputs()[0].name
-    inputs = {input_name: X.astype(np.float32).to_numpy()}
+    inputs = {input_name: X_prepared.to_numpy()}
     outputs = sess.run(None, inputs)
-    if len(outputs) == 2:  # (labels, probas)
+    if len(outputs) == 2:
         proba = outputs[1]
-    else:  # parfois 1 seul output
+    else:
         proba = outputs[0]
     return float(proba[0, 1])
 
-# ------------------------------
-# 1. Configuration & Chargement
-# ------------------------------
+# ======================================================
+# 1. Config
+# ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
 MODEL_FILE = "best_model.onnx"
@@ -74,11 +93,10 @@ THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
 APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 HISTORY_FILE = "history.csv"
-NEW_CLIENTS_FILE = "new_clients.csv"
 
 sess = load_onnx_model(MODEL_FILE)
 
-# Dataset global
+# dataset global
 if os.path.exists(APPLICATION_TRAIN_CSV):
     df_app = load_csv(APPLICATION_TRAIN_CSV)
     st.success("Dataset client chargé.")
@@ -86,12 +104,12 @@ else:
     st.error("❌ application_train.csv introuvable.")
     df_app = pd.DataFrame()
 
-# Artefacts
+# artefacts
 fi_df = pd.read_csv(FEATURE_IMPORTANCE_CSV) if os.path.exists(FEATURE_IMPORTANCE_CSV) else pd.DataFrame()
 th_df = pd.read_csv(THRESHOLDS_CSV) if os.path.exists(THRESHOLDS_CSV) else pd.DataFrame()
 data_drift_available = os.path.exists(DATA_DRIFT_REPORT_HTML)
 
-# Historique
+# historique
 if os.path.exists(HISTORY_FILE):
     persistent_history = pd.read_csv(HISTORY_FILE)
 else:
@@ -99,15 +117,15 @@ else:
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
-# ------------------------------
-# 2. Sélection du Mode
-# ------------------------------
+# ======================================================
+# 2. Mode
+# ======================================================
 st.header("⚙️ Sélection du Mode de Test")
 mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
 
-# ------------------------------
+# ======================================================
 # 3. Client existant
-# ------------------------------
+# ======================================================
 if sess and mode == "Client existant":
     if not df_app.empty:
         max_index = len(df_app) - 1
@@ -122,7 +140,7 @@ if sess and mode == "Client existant":
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba(sess, X)
+            prob_default = predict_proba(sess, X, df_app)
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -139,7 +157,7 @@ if sess and mode == "Client existant":
             st.session_state["history"].append(record)
             append_to_csv(record, HISTORY_FILE)
 
-        # --- Comparaison univariée ---
+        # --- Comparaison univariée
         st.subheader("📈 Comparaison univariée")
         if st.checkbox("Afficher histogramme comparaison"):
             columns_list = [c for c in df_app.columns if c != "TARGET"]
@@ -152,7 +170,7 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
-        # --- Comparaison bivariée ---
+        # --- Comparaison bivariée
         st.subheader("📊 Analyse bivariée")
         if st.checkbox("Afficher scatterplot bivarié"):
             cols = [c for c in df_app.columns if c != "TARGET"]
@@ -170,9 +188,9 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
-# ------------------------------
+# ======================================================
 # 4. Nouveau client
-# ------------------------------
+# ======================================================
 elif sess and mode == "Nouveau client":
     new_client = {}
     new_client["AMT_INCOME_TOTAL"] = st.number_input("AMT_INCOME_TOTAL", value=200000.0)
@@ -181,7 +199,7 @@ elif sess and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba(sess, X)
+        prob_default = predict_proba(sess, X, df_app)
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -192,7 +210,7 @@ elif sess and mode == "Nouveau client":
         st.session_state["history"].append(record)
         append_to_csv(record, HISTORY_FILE)
 
-    # Comparaisons possibles si dataset dispo
+    # Comparaisons
     if not df_app.empty:
         st.subheader("📈 Comparaison univariée")
         if st.checkbox("Comparer histogramme (nouveau client)"):
@@ -222,9 +240,9 @@ elif sess and mode == "Nouveau client":
             ax.legend()
             st.pyplot(fig)
 
-# ------------------------------
+# ======================================================
 # 5. Historique
-# ------------------------------
+# ======================================================
 st.header("🗂️ Historique des Tests")
 if st.session_state["history"]:
     hist = pd.DataFrame(st.session_state["history"])
@@ -238,9 +256,9 @@ with st.expander("Afficher l'historique complet", expanded=True):
         avg_repayment = (1 - combined["default_probability"]).mean()
         st.metric("Performance Moyenne (Probabilité remboursement)", f"{avg_repayment*100:.1f}%")
 
-# ------------------------------
-# 6. Données Générales
-# ------------------------------
+# ======================================================
+# 6. Données générales
+# ======================================================
 with st.expander("📑 Données Générales"):
     if not fi_df.empty:
         st.subheader("Feature Importance")
