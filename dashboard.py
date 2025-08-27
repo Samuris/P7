@@ -71,47 +71,14 @@ def load_onnx_model(path="best_model.onnx"):
         st.error(f"Erreur chargement modèle ONNX : {e}")
         return None
 
-def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
+def predict_proba(sess, X: pd.DataFrame):
     input_name = sess.get_inputs()[0].name
-    expected_dim = sess.get_inputs()[0].shape[1]  # nombre de features attendu
-
-    # Encodage / nettoyage
-    X_prepared = prepare_input(X, ref_df)
-
-    # Alignement du nombre de features
-    if X_prepared.shape[1] < expected_dim:
-        missing = expected_dim - X_prepared.shape[1]
-        missing_cols = pd.DataFrame(
-            np.zeros((len(X_prepared), missing), dtype=np.float32),
-            columns=[f"_missing_{i}" for i in range(missing)]
-        )
-        X_prepared = pd.concat([X_prepared, missing_cols], axis=1)
-    elif X_prepared.shape[1] > expected_dim:
-        X_prepared = X_prepared.iloc[:, :expected_dim]
-
-    # Passage en numpy
-    inputs = {input_name: X_prepared.astype(np.float32).to_numpy()}
-
-    # Inference
+    inputs = {input_name: X.astype(np.float32).to_numpy()}
     outputs = sess.run(None, inputs)
+    # Comme on a mis zipmap=False, la sortie est un tableau numpy (n, 2)
     proba = outputs[0]
+    return float(proba[0, 1])  # probabilité de défaut (classe 1)
 
-    # DEBUG pour voir la vraie sortie
-    st.write("DEBUG sortie ONNX:", proba)
-
-    # Cas classiques
-    if isinstance(proba, np.ndarray):
-        if proba.ndim == 2:  
-            if proba.shape[1] == 2:
-                return float(proba[0, 1])  # proba classe 1 (défaut)
-            else:
-                return float(proba[0, 0])
-        elif proba.ndim == 1:
-            return float(proba[0])
-    elif isinstance(proba, list):
-        return float(proba[0])
-
-    raise ValueError(f"Format de sortie ONNX non géré : {type(proba)}, shape={getattr(proba, 'shape', None)}")
 
 
 
@@ -303,6 +270,7 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
 
 
 
