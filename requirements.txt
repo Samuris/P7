@@ -1,11 +1,12 @@
-streamlit>=1.32
-joblib==1.5.1
+streamlit
 pandas
+numpy
 matplotlib
 seaborn
-numpy
 plotly
+joblib
 scikit-learn==1.7.1
+
 
 
 
