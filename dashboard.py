@@ -112,8 +112,9 @@ def pick_proba(outputs, proba_col: int, debug: bool=False) -> float:
     raise ValueError(f"Format sortie ONNX non géré: {type(proba)} / shape={getattr(proba, 'shape', None)}")
 
 @st.cache_resource
-def infer_best_proba_col(sess, df_app: pd.DataFrame, num_cols, cat_cols, template_cols, sample_n: int = 256) -> int:
-    """Devine si la proba de la classe positive (TARGET=1) est en colonne 0 ou 1."""
+def infer_best_proba_col(_sess, df_app: pd.DataFrame, num_cols, cat_cols, template_cols, sample_n: int = 256) -> int:
+    """Devine si la proba positive est en col 0 ou 1, en ignorant l'objet ONNX pour le cache."""
+    sess = _sess  # <- on l'utilise en interne
     if df_app.empty or "TARGET" not in df_app.columns:
         return 1
     sample = df_app.drop(columns=["TARGET"]).head(sample_n)
@@ -125,8 +126,9 @@ def infer_best_proba_col(sess, df_app: pd.DataFrame, num_cols, cat_cols, templat
     if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] >= 2:
         acc1 = ((proba[:, 1] >= 0.5).astype(int) == y).mean()
         acc0 = ((proba[:, 0] >= 0.5).astype(int) == y).mean()
-        return int(acc1 >= acc0)  # 1 si col1 est meilleure, sinon 0
+        return int(acc1 >= acc0)
     return 1
+
 
 # ======================================================
 # 1. Config
@@ -348,3 +350,4 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
