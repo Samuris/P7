@@ -75,10 +75,10 @@ def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
     input_name = sess.get_inputs()[0].name
     expected_dim = sess.get_inputs()[0].shape[1]  # nombre de features attendu
 
-    # Encodage / nettoyage de base
+    # Encodage / nettoyage
     X_prepared = prepare_input(X, ref_df)
 
-    # 🔹 Ajout des colonnes manquantes d'un coup
+    # Alignement du nombre de features
     if X_prepared.shape[1] < expected_dim:
         missing = expected_dim - X_prepared.shape[1]
         missing_cols = pd.DataFrame(
@@ -89,24 +89,29 @@ def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
     elif X_prepared.shape[1] > expected_dim:
         X_prepared = X_prepared.iloc[:, :expected_dim]
 
-    # Conversion en float32 numpy
+    # Passage en numpy
     inputs = {input_name: X_prepared.astype(np.float32).to_numpy()}
 
     # Inference
     outputs = sess.run(None, inputs)
     proba = outputs[0]
 
-    # Cas 1 : sortie shape (1,2) → prendre la 2e proba (classe positive)
-    if isinstance(proba, np.ndarray) and proba.ndim == 2 and proba.shape[1] == 2:
-        return float(proba[0, 1])
-    # Cas 2 : sortie shape (1,) → déjà une proba
-    elif isinstance(proba, np.ndarray) and proba.ndim == 1:
-        return float(proba[0])
-    # Cas fallback : liste
+    # DEBUG pour voir la vraie sortie
+    st.write("DEBUG sortie ONNX:", proba)
+
+    # Cas classiques
+    if isinstance(proba, np.ndarray):
+        if proba.ndim == 2:  
+            if proba.shape[1] == 2:
+                return float(proba[0, 1])  # proba classe 1 (défaut)
+            else:
+                return float(proba[0, 0])
+        elif proba.ndim == 1:
+            return float(proba[0])
     elif isinstance(proba, list):
         return float(proba[0])
-    else:
-        raise ValueError(f"Format de sortie ONNX non géré : {type(proba)}, shape={getattr(proba, 'shape', None)}")
+
+    raise ValueError(f"Format de sortie ONNX non géré : {type(proba)}, shape={getattr(proba, 'shape', None)}")
 
 
 
@@ -298,5 +303,6 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
 
 
