@@ -5,7 +5,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib, pickle
-
+import onnxruntime as ort
 # ------------------------------
 # Chargement robuste du modèle
 # ------------------------------
@@ -79,8 +79,8 @@ def predict_proba_safely(mdl, X: pd.DataFrame):
 # 1. Configuration & Chargement
 # ------------------------------
 st.title("📊 Dashboard de Credit Scoring")
-
-MODEL_FILE = "best_model_py311.joblib"
+sess = ort.InferenceSession("best_model.onnx")
+MODEL_FILE = "best_model.onnx;"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
@@ -264,4 +264,5 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
 
