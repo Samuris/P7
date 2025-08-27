@@ -27,7 +27,7 @@ def append_to_csv(record: dict, filename: str):
     else:
         df.to_csv(filename, mode='w', index=False)
 
-def display_probability(prob_default):
+def display_probability(prob_default: float):
     prob_default_pct = prob_default * 100
     prob_repayment_pct = (1 - prob_default) * 100
     if (1 - prob_default) >= 0.8:
@@ -40,27 +40,31 @@ def display_probability(prob_default):
     def_str = f"<span style='color: {'red' if (1 - prob_default) < 0.4 else 'black'}; font-size: 20px;'>Probabilité de défaut : {prob_default_pct:.1f} %</span>"
     return rep_str, def_str
 
-
 # ======================================================
-# Encodage des features
+# Encodage des features (numériser les catégorielles)
 # ======================================================
-def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame = None) -> pd.DataFrame:
+def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame | None = None) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
-        if out[col].dtype == object or isinstance(out[col].iloc[0], str):
-            if ref_df is not None and col in ref_df.columns:
-                categories = ref_df[col].astype(str).unique()
-                mapping = {cat: i for i, cat in enumerate(categories)}
-                out[col] = out[col].astype(str).map(mapping).fillna(-1).astype(np.float32)
-            else:
-                out[col], _ = pd.factorize(out[col].astype(str))
+        s = out[col]
+        # 1) tentative conversion numérique
+        num = pd.to_numeric(s, errors="coerce")
+        # si majoritairement numérique, on garde numérique
+        if num.notna().mean() >= 0.5:
+            out[col] = num.fillna(0.0).astype(np.float32)
         else:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+            # catégoriel → map via ref_df si dispo, sinon factorize
+            if ref_df is not None and col in ref_df.columns:
+                cats = ref_df[col].astype(str).unique()
+                mapping = {cat: i for i, cat in enumerate(cats)}
+                out[col] = s.astype(str).map(mapping).fillna(-1).astype(np.float32)
+            else:
+                codes, _ = pd.factorize(s.astype(str))
+                out[col] = codes.astype(np.float32)
     return out.astype(np.float32)
 
-
 # ======================================================
-# ONNX Model
+# ONNX helpers
 # ======================================================
 @st.cache_resource
 def load_onnx_model(path="best_model.onnx"):
@@ -72,21 +76,70 @@ def load_onnx_model(path="best_model.onnx"):
         st.error(f"Erreur chargement modèle ONNX : {e}")
         return None
 
-def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
-    X_prepared = prepare_input(X, ref_df)
-    input_name = sess.get_inputs()[0].name
-    inputs = {input_name: X_prepared.to_numpy().astype(np.float32)}
-    outputs = sess.run(None, inputs)
-    proba = outputs[0]  # zipmap=False → numpy array (n, 2)
-    return float(proba[0, 1])
+def _align_to_expected_dim(sess, X_prepared: pd.DataFrame) -> np.ndarray:
+    """Pad/Tronque pour matcher la dimension d'entrée attendue par l'ONNX, en une seule fois (pas de fragmentation)."""
+    exp_dim = sess.get_inputs()[0].shape[1]
+    if exp_dim is None:
+        # si le modèle ne fournit pas la shape, on passe tel quel
+        return X_prepared.to_numpy(dtype=np.float32)
 
+    cur_dim = X_prepared.shape[1]
+    if cur_dim == exp_dim:
+        return X_prepared.to_numpy(dtype=np.float32)
+
+    if cur_dim < exp_dim:
+        missing = exp_dim - cur_dim
+        pad = pd.DataFrame(
+            np.zeros((len(X_prepared), missing), dtype=np.float32),
+            index=X_prepared.index,
+            columns=[f"_pad_{i}" for i in range(missing)],
+        )
+        X_expanded = pd.concat([X_prepared.reset_index(drop=True), pad.reset_index(drop=True)], axis=1)
+        return X_expanded.to_numpy(dtype=np.float32)
+
+    # trop de colonnes → tronque
+    X_trunc = X_prepared.iloc[:, :exp_dim]
+    return X_trunc.to_numpy(dtype=np.float32)
+
+def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame | None = None, debug: bool = False) -> float:
+    # 1) encoder / nettoyer
+    X_prepared = prepare_input(X, ref_df)
+    # 2) pad / tronque pour matcher exp_dim
+    X_matched = _align_to_expected_dim(sess, X_prepared)
+
+    input_name = sess.get_inputs()[0].name
+    outputs = sess.run(None, {input_name: X_matched})
+
+    # Essayer de récupérer proprement la proba de la classe 1
+    proba = outputs[0]
+    if debug:
+        st.write("DEBUG ONNX → type:", type(proba), " shape:", getattr(proba, "shape", None))
+        st.write("DEBUG ONNX → raw:", proba)
+
+    if isinstance(proba, np.ndarray):
+        if proba.ndim == 2:
+            if proba.shape[1] >= 2:
+                return float(proba[0, 1])
+            else:
+                return float(proba[0, 0])
+        elif proba.ndim == 1:
+            return float(proba[0])
+    if isinstance(proba, list):
+        # parfois liste avec un seul élément
+        v = proba[0]
+        if isinstance(v, (list, tuple, np.ndarray)):
+            v = v[1] if len(v) >= 2 else v[0]
+        return float(v)
+
+    raise ValueError(f"Format de sortie ONNX non géré: {type(proba)} / shape={getattr(proba, 'shape', None)}")
 
 # ======================================================
 # 1. Config
 # ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
-MODEL_FILE = "best_model_proba.onnx"
+# 👉 mets le bon fichier ONNX ici (idéalement converti avec zipmap=False)
+MODEL_FILE = "best_model.onnx"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
@@ -116,13 +169,15 @@ else:
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
+# option debug
+with st.sidebar:
+    debug_mode = st.checkbox("🔧 Mode debug ONNX", value=False)
 
 # ======================================================
 # 2. Mode
 # ======================================================
 st.header("⚙️ Sélection du Mode de Test")
 mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
-
 
 # ======================================================
 # 3. Client existant
@@ -143,7 +198,7 @@ if sess and mode == "Client existant":
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba(sess, X, df_app)
+            prob_default = predict_proba(sess, X, df_app, debug=debug_mode)
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -191,7 +246,6 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
-
 # ======================================================
 # 4. Nouveau client
 # ======================================================
@@ -203,7 +257,7 @@ elif sess and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba(sess, X, df_app)
+        prob_default = predict_proba(sess, X, df_app, debug=debug_mode)
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -243,7 +297,6 @@ elif sess and mode == "Nouveau client":
             ax.legend()
             st.pyplot(fig)
 
-
 # ======================================================
 # 5. Historique
 # ======================================================
@@ -260,7 +313,6 @@ with st.expander("Afficher l'historique complet", expanded=True):
         avg_repayment = (1 - combined["default_probability"]).mean()
         st.metric("Performance Moyenne (Probabilité remboursement)", f"{avg_repayment*100:.1f}%")
 
-
 # ======================================================
 # 6. Données générales
 # ======================================================
@@ -275,4 +327,3 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
-
