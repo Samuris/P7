@@ -72,15 +72,33 @@ def load_onnx_model(path="best_model.onnx"):
         return None
 
 def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
-    X_prepared = prepare_input(X, ref_df)
+    # 🔹 Récupérer les features attendues par le modèle ONNX
     input_name = sess.get_inputs()[0].name
-    inputs = {input_name: X_prepared.to_numpy()}
+    expected_dim = sess.get_inputs()[0].shape[1]  # ex: 247 colonnes
+
+    # 🔹 Encodage catégoriel
+    X_prepared = prepare_input(X, ref_df)
+
+    # 🔹 Compléter ou tronquer les colonnes pour correspondre au modèle
+    if X_prepared.shape[1] < expected_dim:
+        missing = expected_dim - X_prepared.shape[1]
+        for i in range(missing):
+            X_prepared[f"_missing_{i}"] = 0.0  # ajoute colonnes factices
+    elif X_prepared.shape[1] > expected_dim:
+        X_prepared = X_prepared.iloc[:, :expected_dim]
+
+    # 🔹 Convertir en numpy
+    inputs = {input_name: X_prepared.astype(np.float32).to_numpy()}
+
+    # 🔹 Exécution ONNX
     outputs = sess.run(None, inputs)
     if len(outputs) == 2:
         proba = outputs[1]
     else:
         proba = outputs[0]
+
     return float(proba[0, 1])
+
 
 # ======================================================
 # 1. Config
@@ -270,3 +288,4 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
