@@ -13,13 +13,6 @@ import onnxruntime as ort
 def load_csv(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
-@st.cache_data
-def sample_feature(df: pd.DataFrame, feature: str, sample_size: int = 10000):
-    data = df[feature].dropna().replace([np.nan, np.inf, -np.inf], 0)
-    if len(data) > sample_size:
-        return data.sample(sample_size, random_state=42)
-    return data
-
 def append_to_csv(record: dict, filename: str):
     df = pd.DataFrame([record])
     if os.path.exists(filename):
@@ -41,96 +34,89 @@ def display_probability(prob_default: float):
     return rep_str, def_str
 
 # ======================================================
-# Encodage des features (numériser les catégorielles)
-# ======================================================
-def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame | None = None) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        s = out[col]
-        # 1) tentative conversion numérique
-        num = pd.to_numeric(s, errors="coerce")
-        # si majoritairement numérique, on garde numérique
-        if num.notna().mean() >= 0.5:
-            out[col] = num.fillna(0.0).astype(np.float32)
-        else:
-            # catégoriel → map via ref_df si dispo, sinon factorize
-            if ref_df is not None and col in ref_df.columns:
-                cats = ref_df[col].astype(str).unique()
-                mapping = {cat: i for i, cat in enumerate(cats)}
-                out[col] = s.astype(str).map(mapping).fillna(-1).astype(np.float32)
-            else:
-                codes, _ = pd.factorize(s.astype(str))
-                out[col] = codes.astype(np.float32)
-    return out.astype(np.float32)
-
-# ======================================================
-# ONNX helpers
+# ONNX
 # ======================================================
 @st.cache_resource
 def load_onnx_model(path="best_model.onnx"):
     try:
         sess = ort.InferenceSession(path)
-        st.success("✅ Modèle ONNX chargé avec succès.")
+        st.success("✅ Modèle ONNX chargé.")
         return sess
     except Exception as e:
         st.error(f"Erreur chargement modèle ONNX : {e}")
         return None
 
-def _align_to_expected_dim(sess, X_prepared: pd.DataFrame) -> np.ndarray:
-    """Pad/Tronque pour matcher la dimension d'entrée attendue par l'ONNX, en une seule fois (pas de fragmentation)."""
+# ======================================================
+# Prétraitement "gabarit" basé sur df_app (pas de scikit-learn)
+# ======================================================
+def fit_dummy_template(df_app: pd.DataFrame, target_col: str = "TARGET"):
+    base = df_app.drop(columns=[target_col], errors="ignore").copy()
+    # colonnes catégorielles et numériques
+    cat_cols = base.select_dtypes(include=["object"]).columns.tolist()
+    num_cols = [c for c in base.columns if c not in cat_cols]
+    # one-hot complet sur les catégorielles du DF d'entraînement
+    dummies = pd.get_dummies(base[cat_cols].astype(str), dummy_na=False)
+    template_cols = num_cols + list(dummies.columns)  # ordre final
+    return num_cols, cat_cols, template_cols
+
+def transform_with_template(X: pd.DataFrame, num_cols, cat_cols, template_cols) -> pd.DataFrame:
+    # s'assurer que toutes les colonnes existent
+    Xc = X.copy()
+    # numériques
+    num_part = {}
+    for c in num_cols:
+        v = pd.to_numeric(Xc[c], errors="coerce") if c in Xc.columns else pd.Series([0], index=Xc.index)
+        num_part[c] = v.fillna(0.0).astype(np.float32)
+    num_df = pd.DataFrame(num_part, index=X.index)
+
+    # catégorielles -> one hot selon les catégories vues à l'entraînement
+    cat_df_input = pd.DataFrame(index=X.index)
+    for c in cat_cols:
+        cat_df_input[c] = Xc[c].astype(str) if c in Xc.columns else ""
+
+    dummies = pd.get_dummies(cat_df_input.astype(str), dummy_na=False)
+
+    # concat puis réindexer dans l'ORDRE du gabarit
+    out = pd.concat([num_df, dummies], axis=1)
+    out = out.reindex(columns=template_cols, fill_value=0).astype(np.float32)
+    return out
+
+def _align_to_expected_dim(sess, X_mat: pd.DataFrame | np.ndarray) -> np.ndarray:
+    # convert DF->np si besoin
+    arr = X_mat.to_numpy(dtype=np.float32) if isinstance(X_mat, pd.DataFrame) else X_mat.astype(np.float32)
     exp_dim = sess.get_inputs()[0].shape[1]
     if exp_dim is None:
-        # si le modèle ne fournit pas la shape, on passe tel quel
-        return X_prepared.to_numpy(dtype=np.float32)
-
-    cur_dim = X_prepared.shape[1]
+        return arr
+    cur_dim = arr.shape[1]
     if cur_dim == exp_dim:
-        return X_prepared.to_numpy(dtype=np.float32)
-
+        return arr
     if cur_dim < exp_dim:
-        missing = exp_dim - cur_dim
-        pad = pd.DataFrame(
-            np.zeros((len(X_prepared), missing), dtype=np.float32),
-            index=X_prepared.index,
-            columns=[f"_pad_{i}" for i in range(missing)],
-        )
-        X_expanded = pd.concat([X_prepared.reset_index(drop=True), pad.reset_index(drop=True)], axis=1)
-        return X_expanded.to_numpy(dtype=np.float32)
+        pad = np.zeros((arr.shape[0], exp_dim - cur_dim), dtype=np.float32)
+        return np.concatenate([arr, pad], axis=1)
+    # trop long -> tronquer
+    return arr[:, :exp_dim]
 
-    # trop de colonnes → tronque
-    X_trunc = X_prepared.iloc[:, :exp_dim]
-    return X_trunc.to_numpy(dtype=np.float32)
-
-def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame | None = None, debug: bool = False) -> float:
-    # 1) encoder / nettoyer
-    X_prepared = prepare_input(X, ref_df)
-    # 2) pad / tronque pour matcher exp_dim
-    X_matched = _align_to_expected_dim(sess, X_prepared)
-
+def run_onnx_proba(sess, X_np: np.ndarray, debug: bool = False) -> float:
     input_name = sess.get_inputs()[0].name
-    outputs = sess.run(None, {input_name: X_matched})
-
-    # Essayer de récupérer proprement la proba de la classe 1
+    outputs = sess.run(None, {input_name: X_np})
     proba = outputs[0]
     if debug:
-        st.write("DEBUG ONNX → type:", type(proba), " shape:", getattr(proba, "shape", None))
-        st.write("DEBUG ONNX → raw:", proba)
-
+        st.write("DEBUG sortie ONNX type:", type(proba), "shape:", getattr(proba, "shape", None))
+        st.write("DEBUG sortie ONNX raw:", proba)
+    # cas classiques
     if isinstance(proba, np.ndarray):
         if proba.ndim == 2:
             if proba.shape[1] >= 2:
-                return float(proba[0, 1])
+                return float(proba[0, 1])  # proba classe 1
             else:
-                return float(proba[0, 0])
-        elif proba.ndim == 1:
+                return float(proba[0, 0])  # unique colonne -> proba déjà
+        if proba.ndim == 1:
             return float(proba[0])
     if isinstance(proba, list):
-        # parfois liste avec un seul élément
         v = proba[0]
         if isinstance(v, (list, tuple, np.ndarray)):
             v = v[1] if len(v) >= 2 else v[0]
         return float(v)
-
     raise ValueError(f"Format de sortie ONNX non géré: {type(proba)} / shape={getattr(proba, 'shape', None)}")
 
 # ======================================================
@@ -138,12 +124,11 @@ def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame | None = None, deb
 # ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
-# 👉 mets le bon fichier ONNX ici (idéalement converti avec zipmap=False)
-MODEL_FILE = "best_model.onnx"
+MODEL_FILE = "best_model.onnx"      # si tu as exporté avec zipmap=False et proba, c'est parfait
+APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
-APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 HISTORY_FILE = "history.csv"
 
 sess = load_onnx_model(MODEL_FILE)
@@ -155,6 +140,12 @@ if os.path.exists(APPLICATION_TRAIN_CSV):
 else:
     st.error("❌ application_train.csv introuvable.")
     df_app = pd.DataFrame()
+
+# gabarit de colonnes (basé sur df_app)
+if not df_app.empty:
+    NUM_COLS, CAT_COLS, TEMPLATE_COLS = fit_dummy_template(df_app)
+else:
+    NUM_COLS, CAT_COLS, TEMPLATE_COLS = [], [], []
 
 # artefacts
 fi_df = pd.read_csv(FEATURE_IMPORTANCE_CSV) if os.path.exists(FEATURE_IMPORTANCE_CSV) else pd.DataFrame()
@@ -169,9 +160,11 @@ else:
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
-# option debug
+# debug
 with st.sidebar:
     debug_mode = st.checkbox("🔧 Mode debug ONNX", value=False)
+    if sess:
+        st.caption(f"Input attendu: {sess.get_inputs()[0].shape}")
 
 # ======================================================
 # 2. Mode
@@ -193,12 +186,19 @@ if sess and mode == "Client existant":
         if "TARGET" in client_row:
             client_row = client_row.drop("TARGET")
 
+        # Remplacement NaN/inf
         client_row = client_row.replace([np.nan, np.inf, -np.inf], 0)
         client_dict = client_row.to_dict()
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba(sess, X, df_app, debug=debug_mode)
+            # 1) transformer exactement comme df_app
+            X_t = transform_with_template(X, NUM_COLS, CAT_COLS, TEMPLATE_COLS)
+            # 2) aligner la dimension à celle de l'ONNX
+            X_np = _align_to_expected_dim(sess, X_t)
+            # 3) run
+            prob_default = run_onnx_proba(sess, X_np, debug=debug_mode)
+
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -257,7 +257,10 @@ elif sess and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba(sess, X, df_app, debug=debug_mode)
+        X_t = transform_with_template(X, NUM_COLS, CAT_COLS, TEMPLATE_COLS)
+        X_np = _align_to_expected_dim(sess, X_t)
+        prob_default = run_onnx_proba(sess, X_np, debug=debug_mode)
+
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -316,6 +319,14 @@ with st.expander("Afficher l'historique complet", expanded=True):
 # ======================================================
 # 6. Données générales
 # ======================================================
+FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
+THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
+DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
+
+fi_df = pd.read_csv(FEATURE_IMPORTANCE_CSV) if os.path.exists(FEATURE_IMPORTANCE_CSV) else pd.DataFrame()
+th_df = pd.read_csv(THRESHOLDS_CSV) if os.path.exists(THRESHOLDS_CSV) else pd.DataFrame()
+data_drift_available = os.path.exists(DATA_DRIFT_REPORT_HTML)
+
 with st.expander("📑 Données Générales"):
     if not fi_df.empty:
         st.subheader("Feature Importance")
