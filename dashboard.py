@@ -84,7 +84,7 @@ MODEL_FILE = "best_model.joblib"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
-APPLICATION_TRAIN_CSV = "./donnée/application_train.csv"
+APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 HISTORY_FILE = "history.csv"
 NEW_CLIENTS_FILE = "new_clients.csv"
 
@@ -264,3 +264,4 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
