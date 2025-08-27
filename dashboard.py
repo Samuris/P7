@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import joblib, pickle
+from matplotlib.patches import Patch
 
 # onnxruntime est optionnel (utilisé si best_model.joblib contient des onnx_bytes)
 try:
@@ -59,6 +60,35 @@ def sample_feature(df: pd.DataFrame, feature: str, sample_size: int = 10000):
         return data.sample(sample_size, random_state=42)
     return data
 
+def draw_client_marker(ax, x, color="yellow", label="Client sélectionné"):
+    """
+    Marque proprement la position du client :
+    - bande verticale semi-transparente centrée sur x (largeur ~ bin d'histogramme)
+    - chevron en haut pour l'œil
+    - entrée de légende discrète
+    """
+    # Estime la largeur des bins si déjà tracés
+    bin_w = None
+    for p in ax.patches:
+        if hasattr(p, "get_width"):
+            w = p.get_width()
+            if w and w > 0:
+                bin_w = w
+                break
+    xlim = ax.get_xlim()
+    if bin_w is None:
+        bin_w = (xlim[1] - xlim[0]) * 0.01
+
+    ax.axvspan(x - bin_w/2, x + bin_w/2, color=color, alpha=0.25)
+    ylim = ax.get_ylim()
+    ax.plot([x], [ylim[1]*0.95], marker="v", markersize=10, color=color, clip_on=False)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if label not in labels:
+        handles.append(Patch(facecolor=color, alpha=0.25, label=label))
+        labels.append(label)
+        ax.legend(handles=handles, labels=labels)
+
 # ==============================
 # Chargement reference_row
 # ==============================
@@ -66,7 +96,6 @@ def load_reference_row(path="reference_row.csv"):
     if os.path.exists(path):
         try:
             ref_df = pd.read_csv(path, nrows=1)
-            # garde l'ordre exact des colonnes du CSV
             ref_row = ref_df.iloc[0].to_dict()
             feature_order = [c for c in ref_df.columns if c != "TARGET"]
             st.success("Ligne de référence chargée.")
@@ -94,13 +123,11 @@ def load_model_any(path="best_model.joblib"):
             return {"kind": "error", "err": "onnxruntime_missing"}
         try:
             sess = ort.InferenceSession(obj["onnx_bytes"], providers=["CPUExecutionProvider"])
-            # essaie de récupérer la dimension attendue
             shape = sess.get_inputs()[0].shape
             n_in = shape[-1] if isinstance(shape, (list, tuple)) else None
             if not isinstance(n_in, int):
                 n_in = None
             st.success("✅ Modèle ONNX chargé (via best_model.joblib).")
-            # On accepte un éventuel 'feature_order' dans le dict wrapper si tu l'avais mis
             feat_order = obj.get("feature_order", None)
             if feat_order is not None and isinstance(feat_order, (list, tuple)):
                 feat_order = list(feat_order)
@@ -127,7 +154,7 @@ def ensure_features_sklearn(row: dict, expected_features: list | None, reference
     Reproduit la logique Flask:
     - si expected_features connu: on crée un DF avec ces colonnes
     - on complète les manquantes via reference_row (sinon 0)
-    - on cast en numérique quand possible (sinon on laisse tel quel si le pipeline gère)
+    - cast en numérique quand possible (sinon on laisse tel quel si le pipeline gère)
     """
     if expected_features:
         data = {}
@@ -141,13 +168,11 @@ def ensure_features_sklearn(row: dict, expected_features: list | None, reference
         X = pd.DataFrame([data])
     else:
         X = pd.DataFrame([row])
-        # complète avec reference_row pour les colonnes connues
         if reference_row:
             for k, v in reference_row.items():
                 if k not in X.columns:
                     X[k] = v
 
-    # cast numérique si possible
     for c in X.columns:
         try:
             X[c] = pd.to_numeric(X[c])
@@ -158,9 +183,6 @@ def ensure_features_sklearn(row: dict, expected_features: list | None, reference
 def vectorize_for_onnx(row: dict, feature_order: list, reference_row: dict, n_features: int):
     """
     Construit un vecteur float32 (1, n_features) dans l'ordre des colonnes de référence.
-    - Si une feature manque dans row, prend la valeur de reference_row, sinon 0.
-    - Cast float (les categoriels deviennent 0 si non numériques).
-    - Pad/tronque pour matcher n_features du modèle ONNX.
     """
     vals = []
     for feat in feature_order:
@@ -170,7 +192,7 @@ def vectorize_for_onnx(row: dict, feature_order: list, reference_row: dict, n_fe
         except Exception:
             v = 0.0
         vals.append(v)
-    arr = np.asarray(vals, dtype=np.float32)[None, :]  # (1, len(feature_order))
+    arr = np.asarray(vals, dtype=np.float32)[None, :]
 
     if isinstance(n_features, int):
         cur = arr.shape[1]
@@ -206,10 +228,8 @@ def predict_proba_generic(bundle: dict, row_dict: dict, ref_df: pd.DataFrame, re
             return 0.0
         sess = bundle["sess"]
         n_in = bundle.get("n_features")
-        # ordre priorité: ordre fourni dans le wrapper → reference_row.csv → colonnes numériques du df_app
         feature_order = bundle.get("feature_order") or ref_feature_order
         if not feature_order:
-            # fallback: colonnes numériques du dataset global, hors TARGET
             feature_order = [c for c in ref_df.select_dtypes(include=[np.number]).columns if c != "TARGET"]
             if not feature_order:
                 st.error("Impossible de déterminer l'ordre des features pour ONNX.")
@@ -218,8 +238,7 @@ def predict_proba_generic(bundle: dict, row_dict: dict, ref_df: pd.DataFrame, re
         X = vectorize_for_onnx(row_dict, feature_order, reference_row, n_in if isinstance(n_in, int) else len(feature_order))
         input_name = sess.get_inputs()[0].name
         outputs = sess.run(None, {input_name: X})
-        # ONNX sklearn (zipmap=False) retourne typiquement proba en premier ou second output selon l’opérateur
-        # On récupère le premier array "probable" (ndim>=2) sinon on aplatit.
+
         proba_arr = None
         for out in outputs:
             if hasattr(out, "ndim") and out.ndim >= 2:
@@ -230,7 +249,7 @@ def predict_proba_generic(bundle: dict, row_dict: dict, ref_df: pd.DataFrame, re
 
         proba_arr = np.asarray(proba_arr)
         if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
-            return float(proba_arr[0, 1])  # colonne 1 = classe positive
+            return float(proba_arr[0, 1])
         return float(np.ravel(proba_arr)[0])
 
     st.error("Modèle non disponible.")
@@ -283,7 +302,7 @@ mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
 if bundle.get("kind") != "error" and mode == "Client existant":
     if not df_app.empty:
         max_index = len(df_app) - 1
-        idx = st.number_input("Index du client (0 → {max_index})", min_value=0, max_value=max_index, value=0)
+        idx = st.number_input(f"Index du client (0 → {max_index})", min_value=0, max_value=max_index, value=0)
         client_row = df_app.iloc[idx].copy()
         true_target = client_row.get("TARGET", None)
         st.write("**Vérité terrain (TARGET)** :", true_target)
@@ -318,11 +337,9 @@ if bundle.get("kind") != "error" and mode == "Client existant":
             columns_list = [c for c in df_app.columns if c != "TARGET"]
             feature = st.selectbox("Feature", columns_list, index=0)
             fig, ax = plt.subplots()
-            # Histogramme coloré par TARGET (0 = bleu, 1 = rouge)
             sns.histplot(df_app, x=feature, hue="TARGET", palette={0: "blue", 1: "red"}, kde=True, ax=ax)
             client_value = client_dict.get(feature, 0)
-            ax.axvline(client_value, color="yellow", linewidth=2, label="Client sélectionné")
-            ax.legend()
+            draw_client_marker(ax, client_value, color="yellow", label="Client sélectionné")
             st.pyplot(fig)
 
         # --- Comparaison bivariée
@@ -373,8 +390,7 @@ elif bundle.get("kind") != "error" and mode == "Nouveau client":
             feature = st.selectbox("Feature", cols, index=0, key="new_univar")
             fig, ax = plt.subplots()
             sns.histplot(df_app, x=feature, hue="TARGET", palette={0: "blue", 1: "red"}, kde=True, ax=ax)
-            ax.axvline(new_client.get(feature, 0), color="orange", linewidth=2, label="Nouveau client")
-            ax.legend()
+            draw_client_marker(ax, new_client.get(feature, 0), color="orange", label="Nouveau client")
             st.pyplot(fig)
 
         st.subheader("📊 Analyse bivariée")
@@ -414,14 +430,6 @@ with st.expander("Afficher l'historique complet", expanded=True):
         st.metric("Performance Moyenne (Probabilité remboursement)", f"{avg_repayment*100:.1f}%")
 
 # -------- Données générales --------
-FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
-THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
-DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
-
-fi_df = pd.read_csv(FEATURE_IMPORTANCE_CSV) if os.path.exists(FEATURE_IMPORTANCE_CSV) else pd.DataFrame()
-th_df = pd.read_csv(THRESHOLDS_CSV) if os.path.exists(THRESHOLDS_CSV) else pd.DataFrame()
-data_drift_available = os.path.exists(DATA_DRIFT_REPORT_HTML)
-
 with st.expander("📑 Données Générales"):
     if not fi_df.empty:
         st.subheader("Feature Importance")
