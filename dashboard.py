@@ -4,31 +4,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
-import joblib, pickle
 import onnxruntime as ort
-# ------------------------------
-# Chargement robuste du modèle
-# ------------------------------
-class SafeUnpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        if "sklearn._loss._loss" in module and name.startswith("__pyx_unpickle_"):
-            # Renvoie une fonction bidon pour contourner
-            def dummy(*args, **kwargs):
-                raise AttributeError(f"Incompatible attribute {name}")
-            return dummy
-        return super().find_class(module, name)
-
-@st.cache_resource
-def load_model_any(path="best_model.joblib"):
-    try:
-        with open(path, "rb") as f:
-            model = SafeUnpickler(f).load()
-        expected_features = getattr(model, "feature_names_in_", [])
-        st.success("✅ Modèle chargé avec succès.")
-        return model, list(expected_features)
-    except Exception as e:
-        st.error(f"Erreur chargement modèle : {e}")
-        return None, []
 
 # ------------------------------
 # Fonctions utilitaires
@@ -64,22 +40,34 @@ def display_probability(prob_default):
     def_str = f"<span style='color: {'red' if (1 - prob_default) < 0.4 else 'black'}; font-size: 20px;'>Probabilité de défaut : {prob_default_pct:.1f} %</span>"
     return rep_str, def_str
 
-def predict_proba_safely(mdl, X: pd.DataFrame):
-    if hasattr(mdl, "predict_proba"):
-        proba = mdl.predict_proba(X)
-        return float(proba[0, 1])
-    elif hasattr(mdl, "decision_function"):
-        scores = mdl.decision_function(X)
-        return float(1.0 / (1.0 + np.exp(-scores[0])))
-    else:
-        y = mdl.predict(X)
-        return float(y[0])
+# ------------------------------
+# Prédiction ONNX
+# ------------------------------
+@st.cache_resource
+def load_onnx_model(path="best_model.onnx"):
+    try:
+        sess = ort.InferenceSession(path)
+        st.success("✅ Modèle ONNX chargé avec succès.")
+        return sess
+    except Exception as e:
+        st.error(f"Erreur chargement modèle ONNX : {e}")
+        return None
+
+def predict_proba(sess, X: pd.DataFrame):
+    input_name = sess.get_inputs()[0].name
+    inputs = {input_name: X.astype(np.float32).to_numpy()}
+    outputs = sess.run(None, inputs)
+    if len(outputs) == 2:  # (labels, probas)
+        proba = outputs[1]
+    else:  # parfois 1 seul output
+        proba = outputs[0]
+    return float(proba[0, 1])
 
 # ------------------------------
 # 1. Configuration & Chargement
 # ------------------------------
 st.title("📊 Dashboard de Credit Scoring")
-sess = ort.InferenceSession("best_model.onnx")
+
 MODEL_FILE = "best_model.onnx"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
@@ -88,7 +76,7 @@ APPLICATION_TRAIN_CSV = "./donnéecoupé/application_train.csv"
 HISTORY_FILE = "history.csv"
 NEW_CLIENTS_FILE = "new_clients.csv"
 
-model, expected_features = load_model_any(MODEL_FILE)
+sess = load_onnx_model(MODEL_FILE)
 
 # Dataset global
 if os.path.exists(APPLICATION_TRAIN_CSV):
@@ -120,7 +108,7 @@ mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
 # ------------------------------
 # 3. Client existant
 # ------------------------------
-if model is not None and mode == "Client existant":
+if sess and mode == "Client existant":
     if not df_app.empty:
         max_index = len(df_app) - 1
         idx = st.number_input("Index du client :", min_value=0, max_value=max_index, value=0)
@@ -134,7 +122,7 @@ if model is not None and mode == "Client existant":
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba_safely(model, X)
+            prob_default = predict_proba(sess, X)
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -185,7 +173,7 @@ if model is not None and mode == "Client existant":
 # ------------------------------
 # 4. Nouveau client
 # ------------------------------
-elif model is not None and mode == "Nouveau client":
+elif sess and mode == "Nouveau client":
     new_client = {}
     new_client["AMT_INCOME_TOTAL"] = st.number_input("AMT_INCOME_TOTAL", value=200000.0)
     new_client["DAYS_BIRTH"] = st.number_input("DAYS_BIRTH", value=-15000.0)
@@ -193,7 +181,7 @@ elif model is not None and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba_safely(model, X)
+        prob_default = predict_proba(sess, X)
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -264,6 +252,3 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
-
-
-
