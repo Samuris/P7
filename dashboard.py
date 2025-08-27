@@ -40,11 +40,30 @@ def display_probability(prob_default):
     def_str = f"<span style='color: {'red' if (1 - prob_default) < 0.4 else 'black'}; font-size: 20px;'>Probabilité de défaut : {prob_default_pct:.1f} %</span>"
     return rep_str, def_str
 
+
+# ======================================================
+# Encodage des features
+# ======================================================
+def prepare_input(df: pd.DataFrame, ref_df: pd.DataFrame = None) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == object or isinstance(out[col].iloc[0], str):
+            if ref_df is not None and col in ref_df.columns:
+                categories = ref_df[col].astype(str).unique()
+                mapping = {cat: i for i, cat in enumerate(categories)}
+                out[col] = out[col].astype(str).map(mapping).fillna(-1).astype(np.float32)
+            else:
+                out[col], _ = pd.factorize(out[col].astype(str))
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    return out.astype(np.float32)
+
+
 # ======================================================
 # ONNX Model
 # ======================================================
 @st.cache_resource
-def load_onnx_model(path="best_model_proba.onnx"):
+def load_onnx_model(path="best_model.onnx"):
     try:
         sess = ort.InferenceSession(path)
         st.success("✅ Modèle ONNX chargé avec succès.")
@@ -53,20 +72,21 @@ def load_onnx_model(path="best_model_proba.onnx"):
         st.error(f"Erreur chargement modèle ONNX : {e}")
         return None
 
-def predict_proba(sess, X: pd.DataFrame):
+def predict_proba(sess, X: pd.DataFrame, ref_df: pd.DataFrame = None):
+    X_prepared = prepare_input(X, ref_df)
     input_name = sess.get_inputs()[0].name
-    inputs = {input_name: X.astype(np.float32).to_numpy()}
+    inputs = {input_name: X_prepared.to_numpy().astype(np.float32)}
     outputs = sess.run(None, inputs)
-    # zipmap=False → sortie numpy (n, 2)
-    proba = outputs[0]
-    return float(proba[0, 1])  # probabilité défaut (classe 1)
+    proba = outputs[0]  # zipmap=False → numpy array (n, 2)
+    return float(proba[0, 1])
+
 
 # ======================================================
 # 1. Config
 # ======================================================
 st.title("📊 Dashboard de Credit Scoring")
 
-MODEL_FILE = "best_model_proba.onnx"
+MODEL_FILE = "best_model.onnx"
 FEATURE_IMPORTANCE_CSV = "Gradient Boosting_feature_importance.csv"
 THRESHOLDS_CSV = "Gradient Boosting_thresholds.csv"
 DATA_DRIFT_REPORT_HTML = "data_drift_report.html"
@@ -96,11 +116,13 @@ else:
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
+
 # ======================================================
 # 2. Mode
 # ======================================================
 st.header("⚙️ Sélection du Mode de Test")
 mode = st.radio("Choisissez :", ["Client existant", "Nouveau client"])
+
 
 # ======================================================
 # 3. Client existant
@@ -112,14 +134,16 @@ if sess and mode == "Client existant":
         client_row = df_app.iloc[idx].copy()
         true_target = client_row.get("TARGET", None)
         st.write("**Vérité terrain (TARGET)** :", true_target)
+
         if "TARGET" in client_row:
             client_row = client_row.drop("TARGET")
+
         client_row = client_row.replace([np.nan, np.inf, -np.inf], 0)
         client_dict = client_row.to_dict()
 
         if st.button("⚡ Prédire ce client"):
             X = pd.DataFrame([client_dict])
-            prob_default = predict_proba(sess, X)   # ✅ corrigé
+            prob_default = predict_proba(sess, X, df_app)
             rep_str, def_str = display_probability(prob_default)
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
@@ -136,7 +160,7 @@ if sess and mode == "Client existant":
             st.session_state["history"].append(record)
             append_to_csv(record, HISTORY_FILE)
 
-        # --- Comparaison univariée
+        # Comparaison univariée
         st.subheader("📈 Comparaison univariée")
         if st.checkbox("Afficher histogramme comparaison"):
             columns_list = [c for c in df_app.columns if c != "TARGET"]
@@ -149,7 +173,7 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
-        # --- Comparaison bivariée
+        # Comparaison bivariée
         st.subheader("📊 Analyse bivariée")
         if st.checkbox("Afficher scatterplot bivarié"):
             cols = [c for c in df_app.columns if c != "TARGET"]
@@ -167,6 +191,7 @@ if sess and mode == "Client existant":
             ax.legend()
             st.pyplot(fig)
 
+
 # ======================================================
 # 4. Nouveau client
 # ======================================================
@@ -178,7 +203,7 @@ elif sess and mode == "Nouveau client":
 
     if st.button("⚡ Prédire nouveau client"):
         X = pd.DataFrame([new_client])
-        prob_default = predict_proba(sess, X)   # ✅ corrigé
+        prob_default = predict_proba(sess, X, df_app)
         rep_str, def_str = display_probability(prob_default)
         st.markdown(rep_str, unsafe_allow_html=True)
         st.markdown(def_str, unsafe_allow_html=True)
@@ -189,7 +214,6 @@ elif sess and mode == "Nouveau client":
         st.session_state["history"].append(record)
         append_to_csv(record, HISTORY_FILE)
 
-    # Comparaisons
     if not df_app.empty:
         st.subheader("📈 Comparaison univariée")
         if st.checkbox("Comparer histogramme (nouveau client)"):
@@ -219,6 +243,7 @@ elif sess and mode == "Nouveau client":
             ax.legend()
             st.pyplot(fig)
 
+
 # ======================================================
 # 5. Historique
 # ======================================================
@@ -234,6 +259,7 @@ with st.expander("Afficher l'historique complet", expanded=True):
     if "default_probability" in combined:
         avg_repayment = (1 - combined["default_probability"]).mean()
         st.metric("Performance Moyenne (Probabilité remboursement)", f"{avg_repayment*100:.1f}%")
+
 
 # ======================================================
 # 6. Données générales
