@@ -353,10 +353,12 @@ if bundle.get("kind") != "error" and mode == "Client existant":
             st.markdown(rep_str, unsafe_allow_html=True)
             st.markdown(def_str, unsafe_allow_html=True)
             decision = prob_default >= 0.5
-           if bool(true_target) == decision:
+ if true_target is not None:
+               if bool(true_target) == decision:
     st.success("Le modèle a correctement prédit le résultat.")
 else:
     st.warning("Le modèle s'est trompé dans sa prédiction.")
+
 
             record = {
                 "Mode": "Client existant",
