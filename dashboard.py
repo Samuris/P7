@@ -5,7 +5,7 @@ import os
 import io
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+pip install --upgrade pip
 # essaye d'importer onnxruntime proprement
 try:
     import onnxruntime as ort
@@ -435,3 +435,4 @@ with st.expander("📑 Données Générales"):
         st.subheader("Rapport Data Drift")
         with open(DATA_DRIFT_REPORT_HTML, 'r', encoding='utf-8') as f:
             st.components.v1.html(f.read(), height=600, scrolling=True)
+
