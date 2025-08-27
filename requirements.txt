@@ -5,7 +5,8 @@ matplotlib
 seaborn
 numpy
 plotly
-scikit-learn==1.4.2
+scikit-learn==1.7.1
+
 
 
 
